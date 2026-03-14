@@ -31,13 +31,13 @@ model_volume = modal.Volume.from_name(VOLUME_NAME_MODEL)
 
 try:
   print("Deleting input volume")
-  modal.Volume.delete(VOLUME_NAME_INPUT)
+  modal.Volume.objects.delete(VOLUME_NAME_INPUT)
 except:
   print("Input volume is not created yet.")
 
 try:
   print("Deleting output volume")
-  modal.Volume.delete(VOLUME_NAME_OUTPUT)
+  modal.Volume.objects.delete(VOLUME_NAME_OUTPUT)
 except:
   print("Output volume is not created yet.")
 
