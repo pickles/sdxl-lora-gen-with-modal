@@ -1,46 +1,96 @@
-pretrained_model_name_or_path = '/model/＜ベースモデルファイル名＞'
+#==============================================================================
+# パス設定
+#==============================================================================
+pretrained_model_name_or_path = '/model/<ベースモデルファイル名>'
 dataset_config = '/input/dataset.toml'
 output_dir = '/output'
 
-# hyperparameters
+#==============================================================================
+# LoRA ネットワーク設定
+#==============================================================================
+network_module = "networks.lora"
+
+# rank (dim): 大きいほど表現力↑・ファイルサイズ↑・過学習リスク↑ 目安: 8〜64
+network_dim = 16
+# alpha: 実効スケール = alpha / dim。小さいほど学習率が抑制される
+network_alpha = 8
+
+# Conv2d 3x3 への拡張 (LoRA-C3Lier)。省略時は Linear + 1x1 Conv のみ
+network_args = ["conv_dim=8", "conv_alpha=4"]
+
+# U-Net のみを学習する（Text Encoder は固定）。キャプション方式の学習では推奨
+network_train_unet_only = true
+# network_train_text_encoder_only = true  # Text Encoder のみ学習したい場合
+
+# 追加学習（既存 LoRA から継続）する場合に指定
+# network_weights = "/input/<既存LoRAファイル名>.safetensors"
+
+#==============================================================================
+# 学習率・オプティマイザ
+#==============================================================================
+# LoRA の学習率は通常の fine tuning より高めの 1e-4〜1e-3 が推奨
+# unet_lr / text_encoder_lr を個別指定しない場合のデフォルト値
+learning_rate = 1e-4
+# unet_lr = 1e-4          # U-Net の学習率を個別指定する場合
+# text_encoder_lr = 5e-5  # Text Encoder は U-Net より低めが良いとされる
+
+# スケジューラ: constant / constant_with_warmup / cosine / cosine_with_restarts / linear / polynomial
 lr_scheduler = "constant_with_warmup"
-# lr_scheduler_num_cycles = 5
 lr_warmup_steps = 100
-max_token_length = 225
-max_train_epochs = 10
-# optimizer_args = ["weight_decay=0.01", "decouple=True", "use_bias_correction=True"]
+# lr_scheduler_num_cycles = 5  # cosine_with_restarts 使用時のリスタート回数
+
+# オプティマイザ: AdamW / AdamW8bit / Lion / DAdaptation / AdaFactor など
 optimizer_type = "AdamW"
-max_grad_norm = 1.0
-# optimizer_args = ["scale_parameter=False", "relative_step=False", "warmup_init=False"]
+# optimizer_args = ["weight_decay=0.01", "betas=.9,.999"]  # AdamW 向け追加引数
+
+# AdaFactor 使用時の設定例 (学習率自動調整なし):
 # optimizer_type = "AdaFactor"
+# optimizer_args = ["relative_step=False", "scale_parameter=False", "warmup_init=False"]
+# lr_scheduler = "constant_with_warmup"
+# max_grad_norm = 0.0  # AdaFactor はグラジエントクリッピング不要
+
+max_grad_norm = 1.0
 seed = 3407
 
+#==============================================================================
+# エポック・トークン設定
+#==============================================================================
+max_train_epochs = 10
+# SDXL は最大 225 トークン。不要なら 75 のままでよい
+max_token_length = 225
+
+#==============================================================================
+# メモリ・速度最適化
+#==============================================================================
+# VAE の latent を事前キャッシュする（color_aug と同時使用不可）
 cache_latents = true
 cache_latents_to_disk = true
+
+# network_train_unet_only = true の場合のみ有効。Text Encoder 出力をキャッシュして高速化
+cache_text_encoder_outputs = true
+
 gradient_checkpointing = true
-# min_snr_gamma = 5
 lowram = false
+# bf16 は RTX 30 シリーズ以降で使用可能。fp16 の場合は "fp16" に変更
 mixed_precision = "bf16"
 xformers = true
 
+# Min-SNR Weighting Strategy: 論文・公式ともに 5 を推奨
+min_snr_gamma = 5
+
+# ノイズオフセット: 純黒・純白など極端な明暗の生成品質を改善 (0.05〜0.15 程度)
+# noise_offset = 0.1
+
+#==============================================================================
+# チェックポイント保存
+#==============================================================================
 save_every_n_epochs = 1
-# save_every_n_steps = 1000
+# save_every_n_steps = 500
 save_last_n_epochs = 5
-# save_last_n_steps = 5000
+# save_last_n_steps = 2500
 
-# lora
-learning_rate = 1e-5
-# unet_lr = 5e-6
-
-network_train_unet_only = true
-
-network_alpha = 1
-network_args = ["conv_dim=8", "conv_alpha=1"]
-network_dim = 8
-network_module = "networks.lora"
-# network_weights = ""
+#==============================================================================
+# その他
+#==============================================================================
 persistent_data_loader_workers = true
 prior_loss_weight = 1.0
-
-# XL
-# cache_text_encoder_outputs = true
