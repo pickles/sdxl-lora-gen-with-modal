@@ -18,31 +18,15 @@ CONTAINER_PYTHON_VERSION = "3.10"
 # Global Settings
 #==============================================================================
 GPU = "L40S"
-TIMEOUT = 60 * 60 * 2 # 2 hours
+TIMEOUT = 60 * 60 * 3 # 3 hours
 
 VOLUME_NAME_MODEL = "models"
-VOLUME_NAME_INPUT = "inputs"
 VOLUME_NAME_OUTPUT = "outputs"
 
 #==============================================================================
 app = modal.App(f"sdxl-lora-gen")
 
 model_volume = modal.Volume.from_name(VOLUME_NAME_MODEL)
-
-try:
-  print("Deleting input volume")
-  modal.Volume.objects.delete(VOLUME_NAME_INPUT)
-except:
-  print("Input volume is not created yet.")
-
-try:
-  print("Deleting output volume")
-  modal.Volume.objects.delete(VOLUME_NAME_OUTPUT)
-except:
-  print("Output volume is not created yet.")
-
-print("Creating input and output volumes")
-input_volume = modal.Volume.from_name(VOLUME_NAME_INPUT, create_if_missing=True)
 output_volume = modal.Volume.from_name(VOLUME_NAME_OUTPUT, create_if_missing=True)
 
 #==============================================================================
@@ -58,39 +42,61 @@ image = (
     "libxext6",
     "ffmpeg",
     "libgl1")
-  .pip_install(
-    [
-      "torch==2.1.2",
-      "torchvision==0.16.2"
-    ],
-    index_url="https://download.pytorch.org/whl/cu118")
-  .pip_install(
-    "xformers==0.0.23.post1",
-    index_url="https://download.pytorch.org/whl/cu118")
   .run_commands(
+    # 1. PyTorch を CUDA 12.4 ビルドでインストール（公式手順 Step 1）
+    "pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124",
+    # 2. sd-scripts をクローンして依存をインストール（公式手順 Step 2）
+    #    --extra-index-url で cu124 を参照させ、torch/torchvision が CPU 版で上書きされるのを防ぐ
     "git clone https://github.com/kohya-ss/sd-scripts.git",
-    "cd sd-scripts && pip install --upgrade -r requirements.txt")
+    "cd sd-scripts && pip install --upgrade -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124",
+    # 3. xformers を最後にインストール（公式手順 Step 3）
+    "pip install xformers --index-url https://download.pytorch.org/whl/cu124")
 )
 
 #==============================================================================
-volumes= {
-  '/model': model_volume,
-  '/input': input_volume,
-  '/output': output_volume
-}
-
-@app.function(image=image, gpu=GPU, volumes=volumes, timeout=TIMEOUT)
+@app.function(image=image, gpu=GPU, volumes={'/model': model_volume, '/output': output_volume}, timeout=TIMEOUT)
 def generate(name: str):
   print(f"Remote function called. target: {name}")
+
+  local_input = '/tmp/input'
+  os.makedirs(local_input, exist_ok=True)
+
+  # input-{name} volume からローカル /tmp/input にファイルをコピー
+  # （with_options が不要なため、volume API で直接読み込む）
+  input_vol = modal.Volume.from_name(f"input-{name}")
+  print(f"Syncing input-{name} → {local_input}")
+  for entry in input_vol.listdir('/'):
+    if getattr(entry, 'is_dir', False):
+      continue
+    data = b''.join(input_vol.read_file(entry.path))
+    with open(os.path.join(local_input, os.path.basename(entry.path)), 'wb') as f:
+      f.write(data)
+  print(f"Sync complete.")
+
+  # config.toml / dataset.toml の /input パスを /tmp/input に書き換え
+  # （/output は Volume マウント先のまま維持）
+  for fname in ('config.toml', 'dataset.toml'):
+    fpath = os.path.join(local_input, fname)
+    if not os.path.exists(fpath):
+      continue
+    text = open(fpath).read()
+    # '/input/foo' や '/input' 形式の両方を置換
+    text = text.replace("'/input/", f"'{local_input}/")
+    text = text.replace('"/input/', f'"{local_input}/')
+    text = text.replace("'/input'", f"'{local_input}'")
+    text = text.replace('"/input"', f'"{local_input}"')
+    open(fpath, 'w').write(text)
+
   os.chdir('/sd-scripts')
-  subprocess.run("accelerate config default --mixed_precision fp16", shell=True)
-  subprocess.run(
+  subprocess.run("accelerate config default --mixed_precision fp16", shell=True, check=True)
+  result = subprocess.run(
     "accelerate launch --num_cpu_threads_per_process=4 "
     "sdxl_train_network.py "
-    f"--config_file /input/config.toml "
+    f"--config_file {local_input}/config.toml "
     f"--output_name {name} ",
     shell=True)
-  global output_volume
+  if result.returncode != 0:
+    raise RuntimeError(f"Training failed with exit code {result.returncode}")
   output_volume.commit()
 
 @app.local_entrypoint()
@@ -100,16 +106,27 @@ def main(name: str):
     print(f"Target path does not exist: {name}")
     sys.exit(1)
 
-  global input_volume, output_volume
+  input_volume_name = f"input-{name}"
 
-  with input_volume.batch_upload(force=True) as batch:
+  # 既存の入力 Volume を削除してクリーンな状態にする
+  try:
+    modal.Volume.objects.delete(input_volume_name)
+  except Exception:
+    pass
+
+  input_vol = modal.Volume.from_name(input_volume_name, create_if_missing=True)
+  with input_vol.batch_upload(force=True) as batch:
     batch.put_directory(name, '/')
   print("Uploaded")
 
+  # 入力 Volume は generate 内で volume API 経由でコピーする（複数同時実行対応）
   generate.remote(name)
 
-  v = modal.Volume.from_name(VOLUME_NAME_OUTPUT)
+  out_vol = modal.Volume.from_name(VOLUME_NAME_OUTPUT)
   with open(f"{name}.safetensors", "wb") as f:
-    for chunk in v.read_file(f"{name}.safetensors"):
+    for chunk in out_vol.read_file(f"{name}.safetensors"):
       f.write(chunk)
-   
+
+  # 入力 Volume を削除してクリーンアップ
+  modal.Volume.objects.delete(input_volume_name)
+  print(f"Done: {name}.safetensors")
